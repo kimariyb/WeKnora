@@ -23,6 +23,7 @@ type KnowledgePostProcessService struct {
 	chunkService  interfaces.ChunkService
 	taskEnqueuer  interfaces.TaskEnqueuer
 	pendingRepo   interfaces.TaskPendingOpsRepository
+	graphEngine   interfaces.RetrieveGraphRepository
 	redisClient   *redis.Client
 	spanTracker   SpanTracker
 }
@@ -33,6 +34,7 @@ func NewKnowledgePostProcessService(
 	chunkService interfaces.ChunkService,
 	taskEnqueuer interfaces.TaskEnqueuer,
 	pendingRepo interfaces.TaskPendingOpsRepository,
+	graphEngine interfaces.RetrieveGraphRepository,
 	redisClient *redis.Client,
 	spanTracker SpanTracker,
 ) interfaces.TaskHandler {
@@ -42,6 +44,7 @@ func NewKnowledgePostProcessService(
 		chunkService:  chunkService,
 		taskEnqueuer:  taskEnqueuer,
 		pendingRepo:   pendingRepo,
+		graphEngine:   graphEngine,
 		redisClient:   redisClient,
 		spanTracker:   spanTracker,
 	}
@@ -312,6 +315,14 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// 5. Spawn Graph RAG Tasks — only when graph indexing is enabled in IndexingStrategy
 	enqueuedGraphCount := 0
 	if graphChunkCount > 0 {
+		if s.graphEngine != nil {
+			if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{{
+				KnowledgeBase: payload.KnowledgeBaseID,
+				Knowledge:     payload.KnowledgeID,
+			}}); err != nil {
+				logger.Warnf(ctx, "[KnowledgePostProcess] Failed to reset graph namespace for %s: %v", payload.KnowledgeID, err)
+			}
+		}
 		logger.Infof(ctx, "[KnowledgePostProcess] Spawning Graph RAG extract tasks for %d text-like chunks", len(textChunks))
 		for i, chunk := range textChunks {
 			ok, err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, kb.SummaryModelID,

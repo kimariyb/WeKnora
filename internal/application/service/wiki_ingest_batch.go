@@ -853,6 +853,63 @@ func (s *wikiIngestService) mapOneDocument(
 	// surface during wiki page editing.
 	sourceRef := knowledgeID
 	oldPageSlugs := s.getExistingPageSlugsForKnowledge(ctx, payload.KnowledgeBaseID, knowledgeID)
+	cacheKey := wikiMapArtifactKey(
+		payload.TenantID,
+		summaryModelID(chatModel, ""),
+		lang,
+		payload.KnowledgeBaseID,
+		knowledgeID,
+		artifactPromptVersion(
+			agent.WikiCandidateSlugPrompt,
+			agent.WikiKnowledgeExtractPrompt,
+			agent.WikiSummaryPrompt,
+			agent.WikiChunkCitationPrompt,
+			agent.WikiDeduplicationPrompt,
+		),
+		artifactConfigHash(types.JSONMap{
+			"model_name":             chatModel.GetModelName(),
+			"max_content_for_wiki":   maxContentForWiki,
+			"extraction_granularity": batchCtx.ExtractionGranularity,
+			"temperature":            0.3,
+			"llm_max_attempts":       wikiLLMMaxAttempts,
+		}),
+		content,
+	)
+	if s.processCacheRepo != nil {
+		cachePayload, ok, cacheErr := s.processCacheRepo.Get(ctx, cacheKey)
+		if cacheErr != nil {
+			logger.Warnf(ctx, "wiki map cache read failed, recomputing: %v", cacheErr)
+		} else if ok {
+			if result, baseUpdates, ok := wikiMapFromCachePayload(cachePayload, wikiSpan); ok {
+				priorContribution := batchCtx.SummaryContentByKnowledgeID(ctx, knowledgeID)
+				updates, reparseOverlap, staleCount := appendWikiMapRetractions(
+					baseUpdates,
+					result.Pages,
+					oldPageSlugs,
+					priorContribution,
+					content,
+					docTitle,
+					knowledgeID,
+					lang,
+				)
+				if result.MapStats == nil {
+					result.MapStats = types.JSONMap{}
+				}
+				result.MapStats["cache_hit"] = true
+				result.MapStats["old_pages"] = len(oldPageSlugs)
+				result.MapStats["updates"] = len(updates)
+				result.MapStats["reparse_slugs"] = reparseOverlap
+				result.MapStats["stale_slugs"] = staleCount
+				logger.Infof(ctx,
+					"wiki ingest: cache-hit mapped knowledge %s title=%q updates=%d reparse_slugs=%d stale_slugs=%d elapsed=%s",
+					knowledgeID, previewText(result.DocTitle, 80), len(updates), reparseOverlap, staleCount,
+					time.Since(docStartedAt).Round(time.Millisecond),
+				)
+				return result, updates, nil
+			}
+			logger.Warnf(ctx, "wiki map cache payload invalid, recomputing")
+		}
+	}
 
 	// Pass 0: lightweight candidate slug extraction (skeleton only).
 	// On failure we fall back to the legacy single-shot extractor so the doc
@@ -1135,40 +1192,16 @@ func (s *wikiIngestService) mapOneDocument(
 	// empty, so we never consult it.
 	priorContribution := batchCtx.SummaryContentByKnowledgeID(ctx, knowledgeID)
 
-	newSlugSet := make(map[string]bool, len(extractedPages))
-	for _, ns := range extractedPages {
-		newSlugSet[ns.Slug] = true
-	}
-
-	var reparseOverlap, staleCount int
-	for oldSlug := range oldPageSlugs {
-		if newSlugSet[oldSlug] {
-			// Skip summary slugs — they're overwritten wholesale by the
-			// summary update, retract would be ignored downstream.
-			if strings.HasPrefix(oldSlug, "summary/") {
-				continue
-			}
-			reparseOverlap++
-			updates = append(updates, SlugUpdate{
-				Slug:              oldSlug,
-				Type:              "retract",
-				RetractDocContent: priorContribution,
-				DocTitle:          docTitle,
-				KnowledgeID:       knowledgeID,
-				Language:          lang,
-			})
-			continue
-		}
-		staleCount++
-		updates = append(updates, SlugUpdate{
-			Slug:              oldSlug,
-			Type:              "retractStale",
-			RetractDocContent: content,
-			DocTitle:          docTitle,
-			KnowledgeID:       knowledgeID,
-			Language:          lang,
-		})
-	}
+	updates, reparseOverlap, staleCount := appendWikiMapRetractions(
+		updates,
+		extractedPages,
+		oldPageSlugs,
+		priorContribution,
+		content,
+		docTitle,
+		knowledgeID,
+		lang,
+	)
 
 	logger.Infof(ctx,
 		"wiki ingest: mapped knowledge %s title=%q candidates=%d chunks=%d batches=%d cited_chunks=%d uncited_slugs=%d new_slugs=%d updates=%d reparse_slugs=%d stale_slugs=%d pass0_fallback=%v elapsed=%s",
@@ -1202,14 +1235,126 @@ func (s *wikiIngestService) mapOneDocument(
 		"summary_preview":  previewText(docSummaryLine, 160),
 	}
 
-	return &docIngestResult{
+	result := &docIngestResult{
 		KnowledgeID: knowledgeID,
 		DocTitle:    docTitle,
 		Summary:     docSummaryLine,
 		Pages:       extractedPages,
 		MapStats:    mapStats,
 		WikiSpan:    wikiSpan,
-	}, updates, nil
+	}
+	if s.processCacheRepo != nil {
+		if cacheErr := s.processCacheRepo.Put(ctx, cacheKey, wikiMapCachePayload(result, updates)); cacheErr != nil {
+			logger.Warnf(ctx, "wiki map cache write failed: %v", cacheErr)
+		}
+	}
+	return result, updates, nil
+}
+
+type wikiMapCachedResult struct {
+	KnowledgeID string                 `json:"knowledge_id"`
+	DocTitle    string                 `json:"doc_title"`
+	Summary     string                 `json:"summary"`
+	Pages       []types.WikiLogPageRef `json:"pages"`
+	MapStats    types.JSONMap          `json:"map_stats"`
+}
+
+type wikiMapCachedPayload struct {
+	Result  wikiMapCachedResult `json:"result"`
+	Updates []SlugUpdate        `json:"updates"`
+}
+
+func wikiMapCachePayload(result *docIngestResult, updates []SlugUpdate) types.JSONMap {
+	if result == nil {
+		return types.JSONMap{"result": wikiMapCachedResult{}, "updates": []SlugUpdate{}}
+	}
+	return types.JSONMap{
+		"result": wikiMapCachedResult{
+			KnowledgeID: result.KnowledgeID,
+			DocTitle:    result.DocTitle,
+			Summary:     result.Summary,
+			Pages:       append([]types.WikiLogPageRef(nil), result.Pages...),
+			MapStats:    result.MapStats,
+		},
+		"updates": wikiMapBaseUpdates(updates),
+	}
+}
+
+func wikiMapFromCachePayload(payload types.JSONMap, wikiSpan *Span) (*docIngestResult, []SlugUpdate, bool) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, false
+	}
+	var cached wikiMapCachedPayload
+	if err := json.Unmarshal(b, &cached); err != nil {
+		return nil, nil, false
+	}
+	result := &docIngestResult{
+		KnowledgeID: cached.Result.KnowledgeID,
+		DocTitle:    cached.Result.DocTitle,
+		Summary:     cached.Result.Summary,
+		Pages:       cached.Result.Pages,
+		MapStats:    cached.Result.MapStats,
+		WikiSpan:    wikiSpan,
+	}
+	return result, wikiMapBaseUpdates(cached.Updates), true
+}
+
+func wikiMapBaseUpdates(updates []SlugUpdate) []SlugUpdate {
+	base := make([]SlugUpdate, 0, len(updates))
+	for _, update := range updates {
+		if update.Type == "retract" || update.Type == "retractStale" {
+			continue
+		}
+		base = append(base, update)
+	}
+	return base
+}
+
+func appendWikiMapRetractions(
+	baseUpdates []SlugUpdate,
+	extractedPages []types.WikiLogPageRef,
+	oldPageSlugs map[string]bool,
+	priorContribution string,
+	content string,
+	docTitle string,
+	knowledgeID string,
+	lang string,
+) ([]SlugUpdate, int, int) {
+	updates := append([]SlugUpdate(nil), baseUpdates...)
+	newSlugSet := make(map[string]bool, len(extractedPages))
+	for _, ns := range extractedPages {
+		newSlugSet[ns.Slug] = true
+	}
+
+	var reparseOverlap, staleCount int
+	for oldSlug := range oldPageSlugs {
+		if newSlugSet[oldSlug] {
+			if strings.HasPrefix(oldSlug, "summary/") {
+				continue
+			}
+			reparseOverlap++
+			updates = append(updates, SlugUpdate{
+				Slug:              oldSlug,
+				Type:              "retract",
+				RetractDocContent: priorContribution,
+				DocTitle:          docTitle,
+				KnowledgeID:       knowledgeID,
+				Language:          lang,
+			})
+			continue
+		}
+		staleCount++
+		updates = append(updates, SlugUpdate{
+			Slug:              oldSlug,
+			Type:              "retractStale",
+			RetractDocContent: content,
+			DocTitle:          docTitle,
+			KnowledgeID:       knowledgeID,
+			Language:          lang,
+		})
+	}
+	return updates, reparseOverlap, staleCount
 }
 
 func (s *wikiIngestService) extractEntitiesAndConceptsNoUpsert(

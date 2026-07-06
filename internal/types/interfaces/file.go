@@ -17,6 +17,9 @@ type FileService interface {
 	// SaveBytes saves bytes data to a file and returns the file path.
 	// If temp is true, the file will be saved to a temporary storage that may auto-expire.
 	SaveBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error)
+	// SaveContentAddressedBytes saves bytes to a deterministic tenant-scoped cache path.
+	// Implementations must not append timestamps or random suffixes.
+	SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error)
 	// GetFile retrieves a file.
 	GetFile(ctx context.Context, filePath string) (io.ReadCloser, error)
 	// GetFileURL returns a download URL for the file (if supported by the storage backend).

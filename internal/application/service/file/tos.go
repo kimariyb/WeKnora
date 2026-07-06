@@ -226,6 +226,26 @@ func (s *tosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	return fmt.Sprintf("tos://%s/%s", targetBucket, objectName), nil
 }
 
+func (s *tosFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	objectName := joinTOSObjectKey(s.pathPrefix, fmt.Sprintf("%d", tenantID), "exports", "cache", safeName)
+	_, err = s.client.PutObjectV2(ctx, &tos.PutObjectV2Input{
+		PutObjectBasicInput: tos.PutObjectBasicInput{
+			Bucket:      s.bucketName,
+			Key:         objectName,
+			ContentType: utils.GetContentTypeByExt(filepath.Ext(safeName)),
+		},
+		Content: bytes.NewReader(data),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to TOS: %w", err)
+	}
+	return fmt.Sprintf("tos://%s/%s", s.bucketName, objectName), nil
+}
+
 // CopyFile copies an existing TOS object to a new knowledge-owned object using a
 // server-side CopyObject (no data leaves TOS). The destination uses the same
 // layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not a tos:// path.

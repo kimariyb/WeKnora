@@ -178,6 +178,24 @@ func (s *ks3FileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	return fmt.Sprintf("%s%s/%s", ks3Scheme, s.bucketName, objectKey), nil
 }
 
+func (s *ks3FileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	objectKey := joinKS3Key(s.pathPrefix, fmt.Sprintf("%d", tenantID), "exports", "cache", safeName)
+	_, err = s.client.PutObject(&ks3s3.PutObjectInput{
+		Bucket:      ks3aws.String(s.bucketName),
+		Key:         ks3aws.String(objectKey),
+		Body:        bytes.NewReader(data),
+		ContentType: ks3aws.String(utils.GetContentTypeByExt(filepath.Ext(safeName))),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to KS3: %w", err)
+	}
+	return fmt.Sprintf("%s%s/%s", ks3Scheme, s.bucketName, objectKey), nil
+}
+
 // CopyFile copies an existing KS3 object to a new knowledge-owned object using a
 // server-side CopyObject (no data leaves KS3). The destination uses the same
 // layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not a ks3:// path.

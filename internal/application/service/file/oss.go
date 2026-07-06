@@ -243,6 +243,24 @@ func (s *ossFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	return fmt.Sprintf("oss://%s/%s", targetBucket, objectName), nil
 }
 
+func (s *ossFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	objectName := fmt.Sprintf("%s%d/exports/cache/%s", s.pathPrefix, tenantID, safeName)
+	_, err = s.client.PutObject(ctx, &oss.PutObjectRequest{
+		Bucket:      oss.Ptr(s.bucketName),
+		Key:         oss.Ptr(objectName),
+		Body:        bytes.NewReader(data),
+		ContentType: oss.Ptr(utils.GetContentTypeByExt(filepath.Ext(safeName))),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to OSS: %w", err)
+	}
+	return fmt.Sprintf("oss://%s/%s", s.bucketName, objectName), nil
+}
+
 // CopyFile copies an existing OSS object to a new knowledge-owned object using a
 // server-side CopyObject (no data leaves OSS). The destination uses the same
 // layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not an oss:// path.

@@ -26,6 +26,10 @@ func (s *stubIMFileService) SaveBytes(context.Context, []byte, uint64, string, b
 	return "", nil
 }
 
+func (s *stubIMFileService) SaveContentAddressedBytes(context.Context, []byte, uint64, string, bool) (string, error) {
+	return "", nil
+}
+
 func (s *stubIMFileService) GetFile(context.Context, string) (io.ReadCloser, error) {
 	return nil, nil
 }

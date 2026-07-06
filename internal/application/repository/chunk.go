@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // chunkRepository implements the ChunkRepository interface
@@ -51,6 +52,24 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 	// explicitly inserted, bypassing GORM's default value behavior.
 	// SeqID=0 is skipped by GORM automatically (autoIncrement tag).
 	return db.Select("*").CreateInBatches(chunks, 100).Error
+}
+
+func (r *chunkRepository) CreateChunksIgnoreExisting(ctx context.Context, chunks []*types.Chunk) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	for _, chunk := range chunks {
+		chunk.Content = common.CleanInvalidUTF8(chunk.Content)
+	}
+
+	db := r.db.WithContext(ctx)
+	if db.Dialector.Name() == "sqlite" {
+		if err := types.AssignChunkSeqIDs(db, chunks); err != nil {
+			return fmt.Errorf("failed to assign chunk seq_ids: %w", err)
+		}
+	}
+
+	return db.Select("*").Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(chunks, 100).Error
 }
 
 // GetChunkByID retrieves a chunk by its ID and tenant ID
@@ -137,6 +156,25 @@ func (r *chunkRepository) ListChunksByKnowledgeID(
 	var chunks []*types.Chunk
 	if err := r.db.WithContext(ctx).
 		Where("tenant_id = ? AND knowledge_id = ? and chunk_type = ?", tenantID, knowledgeID, "text").
+		Order("chunk_index ASC").
+		Find(&chunks).Error; err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
+
+func (r *chunkRepository) ListChunksByKnowledgeIDIncludeTypes(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID string,
+	chunkTypes []types.ChunkType,
+) ([]*types.Chunk, error) {
+	if len(chunkTypes) == 0 {
+		return []*types.Chunk{}, nil
+	}
+	var chunks []*types.Chunk
+	if err := r.db.WithContext(ctx).
+		Where("tenant_id = ? AND knowledge_id = ? AND chunk_type IN ?", tenantID, knowledgeID, chunkTypes).
 		Order("chunk_index ASC").
 		Find(&chunks).Error; err != nil {
 		return nil, err
@@ -436,6 +474,25 @@ func (r *chunkRepository) DeleteChunks(ctx context.Context, tenantID uint64, ids
 		}
 	}
 	return nil
+}
+
+func (r *chunkRepository) DeleteChunksAndChildren(ctx context.Context, tenantID uint64, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var deletedIDs []string
+	if err := r.db.WithContext(ctx).Model(&types.Chunk{}).
+		Where("tenant_id = ? AND (id IN ? OR parent_chunk_id IN ?)", tenantID, ids, ids).
+		Pluck("id", &deletedIDs).Error; err != nil {
+		return nil, err
+	}
+	if len(deletedIDs) == 0 {
+		return nil, nil
+	}
+	if err := r.DeleteChunks(ctx, tenantID, deletedIDs); err != nil {
+		return nil, err
+	}
+	return deletedIDs, nil
 }
 
 // DeleteChunksByKnowledgeID deletes all chunks for a knowledge ID

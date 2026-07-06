@@ -99,6 +99,19 @@ func (c *captureSaveBytes) SaveBytes(_ context.Context, data []byte, _ uint64, f
 	return u, nil
 }
 
+func (c *captureSaveBytes) SaveContentAddressedBytes(
+	_ context.Context,
+	data []byte,
+	tenantID uint64,
+	fileName string,
+	_ bool,
+) (string, error) {
+	c.saved = append(c.saved, append([]byte(nil), data...))
+	u := "local://test/" + fileName
+	c.urls = append(c.urls, u)
+	return u, nil
+}
+
 func (c *captureSaveBytes) GetFile(context.Context, string) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("not implemented")
 }
@@ -112,6 +125,44 @@ func (c *captureSaveBytes) CopyFile(context.Context, string, uint64, string) (st
 }
 
 var _ interfaces.FileService = (*captureSaveBytes)(nil)
+
+func TestResolveAndStoreUsesContentAddressedImageName(t *testing.T) {
+	png := createTestPNG(200, 150)
+	result := &types.ReadResult{
+		MarkdownContent: "![x](img.png)",
+		ImageRefs: []types.ImageRef{{
+			Filename:    "img.png",
+			OriginalRef: "img.png",
+			MimeType:    "image/png",
+			ImageData:   png,
+			IsOriginal:  true,
+		}},
+	}
+	svc := &captureSaveBytes{}
+	r := NewImageResolver()
+
+	out1, imgs1, err := r.ResolveAndStore(context.Background(), result, svc, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2, imgs2, err := r.ResolveAndStore(context.Background(), result, svc, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out1 != out2 {
+		t.Fatalf("markdown should be stable:\n%s\n%s", out1, out2)
+	}
+	if len(imgs1) != 1 || len(imgs2) != 1 {
+		t.Fatalf("expected one stored image each run, got %d and %d", len(imgs1), len(imgs2))
+	}
+	if imgs1[0].ServingURL != imgs2[0].ServingURL {
+		t.Fatalf("serving URL should be stable: %s vs %s", imgs1[0].ServingURL, imgs2[0].ServingURL)
+	}
+	if imgs1[0].ContentHash == "" || imgs1[0].ContentHash != imgs2[0].ContentHash {
+		t.Fatalf("content hash should be stable and non-empty: %q vs %q", imgs1[0].ContentHash, imgs2[0].ContentHash)
+	}
+}
 
 func TestResolveDataURIImages(t *testing.T) {
 	png := createTestPNG(200, 150)

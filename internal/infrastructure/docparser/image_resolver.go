@@ -25,7 +25,6 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/google/uuid"
 )
 
 const (
@@ -57,6 +56,7 @@ type StoredImage struct {
 	OriginalRef string // reference in the original markdown
 	ServingURL  string // provider:// URL (e.g. local://images/xxx.png, minio://bucket/key)
 	MimeType    string
+	ContentHash string
 }
 
 // ImageResolver reads images from a DocReader ReadResult (inline bytes only)
@@ -181,6 +181,7 @@ func (r *ImageResolver) saveReferencedImage(
 				OriginalRef: refPath,
 				ServingURL:  cached.ServingURL,
 				MimeType:    cached.MimeType,
+				ContentHash: cached.ContentHash,
 			}
 			savedRefs[refPath] = stored
 			return stored, true
@@ -195,8 +196,9 @@ func (r *ImageResolver) saveReferencedImage(
 		ext = ".png"
 	}
 
-	fileName := uuid.New().String() + ext
-	servingURL, saveErr := fileSvc.SaveBytes(ctx, ref.ImageData, tenantID, fileName, false)
+	contentHash := secutils.SHA256HexBytes(ref.ImageData)
+	fileName := secutils.StableImageFilename(ref.ImageData, ext)
+	servingURL, saveErr := fileSvc.SaveContentAddressedBytes(ctx, ref.ImageData, tenantID, fileName, false)
 	if saveErr != nil {
 		log.Printf("WARN: failed to save image %s: %v", refPath, saveErr)
 		return StoredImage{}, false
@@ -206,6 +208,7 @@ func (r *ImageResolver) saveReferencedImage(
 		OriginalRef: refPath,
 		ServingURL:  servingURL,
 		MimeType:    ref.MimeType,
+		ContentHash: contentHash,
 	}
 	savedRefs[refPath] = stored
 	if ref.Filename != "" {
@@ -382,8 +385,9 @@ func (r *ImageResolver) ResolveHTMLDataURIImages(
 		if ext == "" {
 			ext = ".png"
 		}
-		fileName := uuid.New().String() + ext
-		servingURL, saveErr := fileSvc.SaveBytes(ctx, data, tenantID, fileName, false)
+		contentHash := secutils.SHA256HexBytes(data)
+		fileName := secutils.StableImageFilename(data, ext)
+		servingURL, saveErr := fileSvc.SaveContentAddressedBytes(ctx, data, tenantID, fileName, false)
 		if saveErr != nil {
 			log.Printf("WARN: failed to save HTML img data URI image: %v", saveErr)
 			continue
@@ -392,6 +396,7 @@ func (r *ImageResolver) ResolveHTMLDataURIImages(
 			OriginalRef: "html-img-data-uri",
 			ServingURL:  servingURL,
 			MimeType:    mimeType,
+			ContentHash: contentHash,
 		})
 		markdown = markdown[:m[0]] + fmt.Sprintf("![image](%s)", servingURL) + markdown[m[1]:]
 		processed++
@@ -521,8 +526,9 @@ func (r *ImageResolver) resolveBareDataURIs(
 		if ext == "" {
 			ext = ".png"
 		}
-		fileName := uuid.New().String() + ext
-		servingURL, saveErr := fileSvc.SaveBytes(ctx, data, tenantID, fileName, false)
+		contentHash := secutils.SHA256HexBytes(data)
+		fileName := secutils.StableImageFilename(data, ext)
+		servingURL, saveErr := fileSvc.SaveContentAddressedBytes(ctx, data, tenantID, fileName, false)
 		if saveErr != nil {
 			log.Printf("WARN: failed to save bare data URI image: %v", saveErr)
 			continue
@@ -531,6 +537,7 @@ func (r *ImageResolver) resolveBareDataURIs(
 			OriginalRef: "bare-data-uri",
 			ServingURL:  servingURL,
 			MimeType:    mimeType,
+			ContentHash: contentHash,
 		})
 		if insideWrapper {
 			// Inside a broken markdown ref like ![weird]alt](data:...) — replace data URI only
@@ -589,8 +596,9 @@ func (r *ImageResolver) resolveBareBase64Prefix(
 		if ext == "" {
 			ext = ".png"
 		}
-		fileName := uuid.New().String() + ext
-		servingURL, saveErr := fileSvc.SaveBytes(ctx, data, tenantID, fileName, false)
+		contentHash := secutils.SHA256HexBytes(data)
+		fileName := secutils.StableImageFilename(data, ext)
+		servingURL, saveErr := fileSvc.SaveContentAddressedBytes(ctx, data, tenantID, fileName, false)
 		if saveErr != nil {
 			log.Printf("WARN: failed to save bare base64 image: %v", saveErr)
 			continue
@@ -599,6 +607,7 @@ func (r *ImageResolver) resolveBareBase64Prefix(
 			OriginalRef: "bare-base64",
 			ServingURL:  servingURL,
 			MimeType:    mimeType,
+			ContentHash: contentHash,
 		})
 		markdown = markdown[:m[0]] + fmt.Sprintf("![image](%s)", servingURL) + markdown[m[1]:]
 		processed++
@@ -721,8 +730,9 @@ func (r *ImageResolver) ResolveDataURIImages(
 		if ext == "" {
 			ext = ".png"
 		}
-		fileName := uuid.New().String() + ext
-		servingURL, saveErr := fileSvc.SaveBytes(ctx, data, tenantID, fileName, false)
+		contentHash := secutils.SHA256HexBytes(data)
+		fileName := secutils.StableImageFilename(data, ext)
+		servingURL, saveErr := fileSvc.SaveContentAddressedBytes(ctx, data, tenantID, fileName, false)
 		if saveErr != nil {
 			log.Printf("WARN: failed to save data URI image: %v", saveErr)
 			continue
@@ -731,6 +741,7 @@ func (r *ImageResolver) ResolveDataURIImages(
 			OriginalRef: dataURI,
 			ServingURL:  servingURL,
 			MimeType:    mimeType,
+			ContentHash: contentHash,
 		})
 		markdown = markdown[:m[4]] + servingURL + markdown[m[5]:]
 		processed++
@@ -822,15 +833,16 @@ func (r *ImageResolver) ResolveRemoteImages(
 		}
 
 		var servingURL string
+		contentHash := secutils.SHA256HexBytes(data)
 		if whitelisted {
 			// Keep the original URL — ImageMultimodalService will download it
 			// directly for OCR/caption analysis.
 			servingURL = imgURL
 		} else {
 			// --- Upload to storage ---
-			fileName := uuid.New().String() + ext
+			fileName := secutils.StableImageFilename(data, ext)
 			var saveErr error
-			servingURL, saveErr = fileSvc.SaveBytes(ctx, data, tenantID, fileName, false)
+			servingURL, saveErr = fileSvc.SaveContentAddressedBytes(ctx, data, tenantID, fileName, false)
 			if saveErr != nil {
 				log.Printf("WARN: failed to save remote image %s: %v", imgURL, saveErr)
 				continue
@@ -841,6 +853,7 @@ func (r *ImageResolver) ResolveRemoteImages(
 			OriginalRef: imgURL,
 			ServingURL:  servingURL,
 			MimeType:    mimeType,
+			ContentHash: contentHash,
 		})
 
 		if !whitelisted {

@@ -28,6 +28,9 @@ func (f *fakeFileService) SaveFile(ctx context.Context, _ *multipart.FileHeader,
 func (f *fakeFileService) SaveBytes(ctx context.Context, _ []byte, _ uint64, _ string, _ bool) (string, error) {
 	return "", errors.New("not implemented in fake")
 }
+func (f *fakeFileService) SaveContentAddressedBytes(ctx context.Context, _ []byte, _ uint64, _ string, _ bool) (string, error) {
+	return "", errors.New("not implemented in fake")
+}
 func (f *fakeFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
 	fn, ok := f.readers[filePath]
 	if !ok {

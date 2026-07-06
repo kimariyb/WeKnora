@@ -162,6 +162,7 @@ type ChunkExtractService struct {
 	knowledgeRepo     interfaces.KnowledgeRepository
 	chunkRepo         interfaces.ChunkRepository
 	graphEngine       interfaces.RetrieveGraphRepository
+	processCacheRepo  interfaces.ProcessArtifactCacheRepository
 	// spanTracker records this graph-extract task's subspan under the
 	// parent attempt's postprocess stage so the trace viewer shows real
 	// per-chunk graph extraction time rather than the upstream's enqueue.
@@ -176,6 +177,7 @@ func NewChunkExtractService(
 	knowledgeRepo interfaces.KnowledgeRepository,
 	chunkRepo interfaces.ChunkRepository,
 	graphEngine interfaces.RetrieveGraphRepository,
+	processCacheRepo interfaces.ProcessArtifactCacheRepository,
 	spanTracker SpanTracker,
 ) interfaces.TaskHandler {
 	return &ChunkExtractService{
@@ -185,6 +187,7 @@ func NewChunkExtractService(
 		knowledgeRepo:     knowledgeRepo,
 		chunkRepo:         chunkRepo,
 		graphEngine:       graphEngine,
+		processCacheRepo:  processCacheRepo,
 		spanTracker:       spanTracker,
 	}
 }
@@ -194,6 +197,39 @@ func (s *ChunkExtractService) tracker() SpanTracker {
 		return noopSpanTracker{}
 	}
 	return s.spanTracker
+}
+
+func graphDataCachePayload(graph *types.GraphData) types.JSONMap {
+	if graph == nil {
+		return types.JSONMap{"graph": &types.GraphData{}}
+	}
+	var cached types.GraphData
+	if b, err := json.Marshal(graph); err == nil {
+		_ = json.Unmarshal(b, &cached)
+	}
+	for _, node := range cached.Node {
+		node.Chunks = nil
+	}
+	return types.JSONMap{"graph": cached}
+}
+
+func graphDataFromCachePayload(payload types.JSONMap) (*types.GraphData, bool) {
+	raw, ok := payload["graph"]
+	if !ok {
+		return nil, false
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	var graph types.GraphData
+	if err := json.Unmarshal(b, &graph); err != nil {
+		return nil, false
+	}
+	for _, node := range graph.Node {
+		node.Chunks = nil
+	}
+	return &graph, true
 }
 
 // Handle handles the chunk extraction task
@@ -327,10 +363,44 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		},
 	}
 	extractor := chatpipeline.NewExtractor(chatModel, template)
-	graph, err := extractor.Extract(ctx, chunk.Content)
-	if err != nil {
-		handleErr = err
-		return err
+
+	cacheKey := graphChunkArtifactKey(
+		p.TenantID,
+		summaryModelID(chatModel, p.ModelID),
+		artifactPromptVersion(template.Description, artifactConfigHash(template.Tags), artifactConfigHash(template.Examples)),
+		artifactConfigHash(types.JSONMap{
+			"model_name":     chatModel.GetModelName(),
+			"extract_config": extractCfg,
+		}),
+		chunk.Content,
+	)
+	graphCacheHit := false
+	var graph *types.GraphData
+	if s.processCacheRepo != nil {
+		cachePayload, ok, cacheErr := s.processCacheRepo.Get(ctx, cacheKey)
+		if cacheErr != nil {
+			logger.Warnf(ctx, "graph chunk cache read failed, recomputing: %v", cacheErr)
+		} else if ok {
+			if cachedGraph, ok := graphDataFromCachePayload(cachePayload); ok {
+				graph = cachedGraph
+				graphCacheHit = true
+				graphOut["cache_hit"] = true
+			} else {
+				logger.Warnf(ctx, "graph chunk cache payload invalid, recomputing")
+			}
+		}
+	}
+	if !graphCacheHit {
+		graph, err = extractor.Extract(ctx, chunk.Content)
+		if err != nil {
+			handleErr = err
+			return err
+		}
+		if s.processCacheRepo != nil {
+			if cacheErr := s.processCacheRepo.Put(ctx, cacheKey, graphDataCachePayload(graph)); cacheErr != nil {
+				logger.Warnf(ctx, "graph chunk cache write failed: %v", cacheErr)
+			}
+		}
 	}
 
 	chunk, err = s.chunkRepo.GetChunkByID(ctx, p.TenantID, p.ChunkID)

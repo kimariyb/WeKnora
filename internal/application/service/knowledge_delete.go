@@ -49,10 +49,18 @@ func deleteExtractedImages(ctx context.Context, fileSvc interfaces.FileService, 
 	}
 	logger.Infof(ctx, "Deleting %d extracted images", len(imageURLs))
 	for _, url := range imageURLs {
+		if isContentAddressedArtifactPath(url) {
+			logger.Infof(ctx, "Skipping shared content-addressed image artifact: %s", url)
+			continue
+		}
 		if err := fileSvc.DeleteFile(ctx, url); err != nil {
 			logger.Errorf(ctx, "Failed to delete extracted image %s: %v", url, err)
 		}
 	}
+}
+
+func isContentAddressedArtifactPath(path string) bool {
+	return strings.Contains(path, "/exports/cache/")
 }
 
 // DeleteKnowledge deletes a knowledge entry and all related resources

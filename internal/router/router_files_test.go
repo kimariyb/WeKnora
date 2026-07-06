@@ -34,6 +34,10 @@ func (s *stubFileService) SaveBytes(ctx context.Context, data []byte, tenantID u
 	panic("unexpected call to SaveBytes")
 }
 
+func (s *stubFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	panic("unexpected call to SaveContentAddressedBytes")
+}
+
 func (s *stubFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
 	if s.getFile == nil {
 		panic("unexpected call to GetFile")

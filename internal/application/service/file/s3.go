@@ -302,6 +302,26 @@ func (s *s3FileService) SaveBytes(ctx context.Context, data []byte, tenantID uin
 	return fmt.Sprintf("s3://%s/%s", s.bucketName, objectName), nil
 }
 
+func (s *s3FileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	objectName := fmt.Sprintf("%s%d/exports/cache/%s", s.pathPrefix, tenantID, safeName)
+	reader := bytes.NewReader(data)
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucketName),
+		Key:           aws.String(objectName),
+		Body:          reader,
+		ContentLength: aws.Int64(int64(len(data))),
+		ContentType:   aws.String(utils.GetContentTypeByExt(filepath.Ext(safeName))),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to S3: %w", err)
+	}
+	return fmt.Sprintf("s3://%s/%s", s.bucketName, objectName), nil
+}
+
 // GetFileURL returns a presigned download URL for the file
 func (s *s3FileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
 	objectName, err := s.parseS3FilePath(filePath)

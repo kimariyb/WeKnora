@@ -215,3 +215,26 @@ func TestUpdateChunk_SQLite_NoNOWError(t *testing.T) {
 	require.NoError(t, db.First(&saved, "id = ?", chunk.ID).Error)
 	assert.Equal(t, "updated content", saved.Content)
 }
+
+func TestDeleteChunksAndChildren_SQLiteDeletesDirectChildren(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	kbID := uuid.New().String()
+	knowledgeID := uuid.New().String()
+	parent := makeChunk(kbID, knowledgeID, string(types.ChunkTypeText))
+	child := makeChunk(kbID, knowledgeID, string(types.ChunkTypeImageOCR))
+	child.ParentChunkID = parent.ID
+	sibling := makeChunk(kbID, knowledgeID, string(types.ChunkTypeText))
+	require.NoError(t, repo.CreateChunks(ctx, []*types.Chunk{parent, child, sibling}))
+
+	deleted, err := repo.DeleteChunksAndChildren(ctx, parent.TenantID, []string{parent.ID})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{parent.ID, child.ID}, deleted)
+
+	var remaining []types.Chunk
+	require.NoError(t, db.Find(&remaining).Error)
+	require.Len(t, remaining, 1)
+	require.Equal(t, sibling.ID, remaining[0].ID)
+}

@@ -1,6 +1,7 @@
 package file
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -299,7 +301,7 @@ func (s *obsFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucketName),
 		Key:         aws.String(objectKey),
-		Body:        strings.NewReader(string(data)),
+		Body:        bytes.NewReader(data),
 		ContentType: aws.String("application/octet-stream"),
 		ACL:         "public-read",
 	})
@@ -307,6 +309,34 @@ func (s *obsFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 		return "", fmt.Errorf("failed to upload bytes to OBS: %w", err)
 	}
 
+	prefix := s.getPrifix()
+	if s.proxyDomain != "" {
+		return fmt.Sprintf("%s%s", prefix, objectKey), nil
+	}
+	return fmt.Sprintf("%s%s/%s", prefix, s.bucketName, objectKey), nil
+}
+
+func (s *obsFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	var objectKey string
+	if s.pathPrefix != "" {
+		objectKey = fmt.Sprintf("%s/%d/exports/cache/%s", s.pathPrefix, tenantID, safeName)
+	} else {
+		objectKey = fmt.Sprintf("%d/exports/cache/%s", tenantID, safeName)
+	}
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucketName),
+		Key:         aws.String(objectKey),
+		Body:        strings.NewReader(string(data)),
+		ContentType: aws.String(utils.GetContentTypeByExt(filepath.Ext(safeName))),
+		ACL:         "public-read",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to OBS: %w", err)
+	}
 	prefix := s.getPrifix()
 	if s.proxyDomain != "" {
 		return fmt.Sprintf("%s%s", prefix, objectKey), nil

@@ -751,3 +751,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_stores_name_tenant
 CREATE INDEX IF NOT EXISTS idx_vector_stores_tenant_id ON vector_stores(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_vector_stores_engine_type ON vector_stores(engine_type);
 CREATE INDEX IF NOT EXISTS idx_vector_stores_deleted_at ON vector_stores(deleted_at);
+
+CREATE TABLE IF NOT EXISTS process_artifact_caches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER NOT NULL,
+    artifact_type VARCHAR(64) NOT NULL,
+    cache_key VARCHAR(128) NOT NULL,
+    model_id VARCHAR(128) NOT NULL DEFAULT '',
+    config_hash VARCHAR(64) NOT NULL DEFAULT '',
+    prompt_version VARCHAR(64) NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_process_artifact_cache_key
+    ON process_artifact_caches (
+        tenant_id,
+        artifact_type,
+        cache_key,
+        model_id,
+        config_hash,
+        prompt_version
+    );
+CREATE INDEX IF NOT EXISTS idx_process_artifact_cache_tenant_type
+    ON process_artifact_caches (tenant_id, artifact_type, updated_at DESC);

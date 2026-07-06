@@ -32,6 +32,10 @@ func (c *countingFileService) SaveBytes(ctx context.Context, data []byte, tenant
 	return "", nil
 }
 
+func (c *countingFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	return "", nil
+}
+
 func (c *countingFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
 	return nil, errors.New("not implemented")
 }

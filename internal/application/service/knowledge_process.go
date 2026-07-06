@@ -281,36 +281,13 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		logger.Infof(ctx, "Vector/keyword indexing disabled for KB %s, skipping embedding model", kb.ID)
 	}
 
-	// 幂等性处理：清理旧的chunks和索引数据，避免重复数据
-	logger.Infof(ctx, "Cleaning up existing chunks and index data for knowledge: %s", knowledge.ID)
-
-	// 删除旧的chunks
-	if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
-		logger.Warnf(ctx, "Failed to delete existing chunks (may not exist): %v", err)
-		// 不返回错误，继续处理（可能没有旧数据）
-	}
-
-	// 删除旧的索引数据 — only when vector/keyword indexing is enabled
 	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 	retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
 		ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
-	if err == nil && embeddingModel != nil {
-		if err := retrieveEngine.DeleteByKnowledgeIDList(ctx, []string{knowledge.ID}, embeddingModel.GetDimensions(), knowledge.Type); err != nil {
-			logger.Warnf(ctx, "Failed to delete existing index data (may not exist): %v", err)
-			// 不返回错误，继续处理（可能没有旧数据）
-		} else {
-			logger.Infof(ctx, "Successfully deleted existing index data for knowledge: %s", knowledge.ID)
-		}
+	if err != nil {
+		logger.Warnf(ctx, "Failed to create retrieve engine for knowledge %s: %v", knowledge.ID, err)
 	}
-
-	// 删除知识图谱数据（如果存在）
-	namespace := types.NameSpace{KnowledgeBase: knowledge.KnowledgeBaseID, Knowledge: knowledge.ID}
-	if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{namespace}); err != nil {
-		logger.Warnf(ctx, "Failed to delete existing graph data (may not exist): %v", err)
-		// 不返回错误，继续处理
-	}
-
-	logger.Infof(ctx, "Cleanup completed, starting to process new chunks")
+	logger.Infof(ctx, "Starting rebuild-aware chunk processing for knowledge: %s", knowledge.ID)
 
 	// ========== DocReader 解析结果日志 ==========
 	logger.Infof(ctx, "[DocReader] ========== 解析结果概览 ==========")
@@ -379,15 +356,21 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// === Parent-Child Chunking: create parent chunks first ===
 	hasParentChild := len(options.ParentChunks) > 0
 	var parentDBChunks []*types.Chunk // indexed by ParsedParentChunk position
+	chunkIDOccurrences := map[string]int{}
 	if hasParentChild {
 		parentDBChunks = make([]*types.Chunk, len(options.ParentChunks))
 		for i, pc := range options.ParentChunks {
+			contentHash := textContentHash(pc.Content)
+			occurrenceKey := string(types.ChunkTypeParentText) + "\x00" + contentHash
+			occurrence := chunkIDOccurrences[occurrenceKey]
+			chunkIDOccurrences[occurrenceKey] = occurrence + 1
 			parentDBChunks[i] = &types.Chunk{
-				ID:              uuid.New().String(),
+				ID:              stableChunkID(knowledge.ID, types.ChunkTypeParentText, contentHash, occurrence),
 				TenantID:        knowledge.TenantID,
 				KnowledgeID:     knowledge.ID,
 				KnowledgeBaseID: knowledge.KnowledgeBaseID,
 				Content:         pc.Content,
+				ContentHash:     contentHash,
 				ChunkIndex:      pc.Seq,
 				IsEnabled:       true,
 				CreatedAt:       time.Now(),
@@ -421,12 +404,17 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		}
 
 		// 创建主文本Chunk
+		contentHash := textContentHash(chunkData.EmbeddingContent())
+		occurrenceKey := string(types.ChunkTypeText) + "\x00" + contentHash
+		occurrence := chunkIDOccurrences[occurrenceKey]
+		chunkIDOccurrences[occurrenceKey] = occurrence + 1
 		textChunk := &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              stableChunkID(knowledge.ID, types.ChunkTypeText, contentHash, occurrence),
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
 			KnowledgeBaseID: knowledge.KnowledgeBaseID,
 			Content:         chunkData.Content,
+			ContentHash:     contentHash,
 			ContextHeader:   chunkData.ContextHeader,
 			ChunkIndex:      int(chunkData.Seq),
 			IsEnabled:       true,
@@ -482,13 +470,55 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		return
 	}
 
+	existingChunks, err := s.chunkService.ListChunksByKnowledgeIDIncludeTypes(ctx, knowledge.TenantID, knowledge.ID, []types.ChunkType{
+		types.ChunkTypeText,
+		types.ChunkTypeParentText,
+	})
+	if err != nil {
+		knowledge.ParseStatus = types.ParseStatusFailed
+		knowledge.ErrorMessage = err.Error()
+		knowledge.UpdatedAt = time.Now()
+		s.repo.UpdateKnowledge(ctx, knowledge)
+		s.failStage(ctx, knowledge.ID, types.StageChunking,
+			werrors.ErrCodeChunkingFailed, "list existing chunks failed", err)
+		return
+	}
+	existingByID := make(map[string]*types.Chunk, len(existingChunks))
+	for _, chunk := range existingChunks {
+		existingByID[chunk.ID] = chunk
+	}
+
+	plannedIDs := make(map[string]bool, len(insertChunks))
+	chunksToCreate := make([]*types.Chunk, 0, len(insertChunks))
+	textChunkIDsToIndex := make(map[string]bool, len(textChunks))
+	for _, chunk := range insertChunks {
+		plannedIDs[chunk.ID] = true
+		if _, exists := existingByID[chunk.ID]; exists {
+			continue
+		}
+		chunksToCreate = append(chunksToCreate, chunk)
+		if chunk.ChunkType == types.ChunkTypeText {
+			textChunkIDsToIndex[chunk.ID] = true
+		}
+	}
+
+	obsoleteIDs := make([]string, 0)
+	for id, old := range existingByID {
+		if !plannedIDs[id] && old.ChunkType != types.ChunkTypeFAQ {
+			obsoleteIDs = append(obsoleteIDs, id)
+		}
+	}
+
 	// Save chunks to database — ALWAYS, regardless of indexing strategy.
 	// Chunks are needed for wiki generation, graph extraction, and summary generation
 	// even when vector/keyword indexing is disabled.
 	s.beginStage(ctx, knowledge.ID, types.StageChunking, types.JSONMap{
-		"chunks_planned": len(insertChunks),
+		"chunks_planned":   len(insertChunks),
+		"chunks_existing":  len(existingByID),
+		"chunks_to_create": len(chunksToCreate),
+		"chunks_obsolete":  len(obsoleteIDs),
 	})
-	if err := s.chunkService.CreateChunks(ctx, insertChunks); err != nil {
+	if err := s.chunkService.CreateChunksIgnoreExisting(ctx, chunksToCreate); err != nil {
 		knowledge.ParseStatus = types.ParseStatusFailed
 		knowledge.ErrorMessage = err.Error()
 		knowledge.UpdatedAt = time.Now()
@@ -502,7 +532,8 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		totalChunkChars += len(c.Content)
 	}
 	s.endStage(ctx, knowledge.ID, types.StageChunking, types.JSONMap{
-		"chunks_written":   len(insertChunks),
+		"chunks_written":   len(chunksToCreate),
+		"chunks_reused":    len(insertChunks) - len(chunksToCreate),
 		"total_text_chars": totalChunkChars,
 	})
 
@@ -510,8 +541,17 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// Chunks are ALWAYS saved to DB (above) because wiki and graph need them even without vector indexing.
 	var totalStorageSize int64
 	if kb.NeedsEmbeddingModel() && embeddingModel != nil {
+		if err != nil {
+			knowledge.ParseStatus = types.ParseStatusFailed
+			knowledge.ErrorMessage = err.Error()
+			knowledge.UpdatedAt = time.Now()
+			s.repo.UpdateKnowledge(ctx, knowledge)
+			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
+				werrors.ErrCodeVectorStoreWriteFailed, "create retrieve engine failed", err)
+			return
+		}
 		embedInput := types.JSONMap{
-			"chunks_to_embed": len(textChunks),
+			"chunks_to_embed": len(textChunkIDsToIndex),
 			"model_id":        kb.EmbeddingModelID,
 		}
 		if dim := embeddingModel.GetDimensions(); dim > 0 {
@@ -528,6 +568,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			titlePrefix = t + "\n"
 		}
 		for _, chunk := range textChunks {
+			if !textChunkIDsToIndex[chunk.ID] {
+				continue
+			}
 			// chunk.EmbeddingContent prepends ContextHeader (heading breadcrumb)
 			// when the chunker populated it during Tier-1 splitting; falls back
 			// to plain Content otherwise. Title prefix sits outermost.
@@ -540,6 +583,14 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				KnowledgeID:     knowledge.ID,
 				KnowledgeBaseID: knowledge.KnowledgeBaseID,
 				IsEnabled:       true,
+			})
+		}
+
+		if len(indexInfoList) == 0 {
+			logger.Infof(ctx, "No new text chunks to index for knowledge %s; embedding stage cache hit", knowledge.ID)
+			s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
+				"vectors_written": 0,
+				"cache_hit":       true,
 			})
 		}
 
@@ -578,7 +629,10 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			return
 		}
 
-		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
+		if len(indexInfoList) > 0 {
+			embeddingModel = wrapEmbedderWithProcessCache(knowledge.TenantID, embeddingModel, s.processCacheRepo)
+			err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
+		}
 		if err != nil {
 			knowledge.ParseStatus = types.ParseStatusFailed
 			knowledge.ErrorMessage = err.Error()
@@ -606,11 +660,24 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				code, "batch index failed", err)
 			return
 		}
-		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
-		s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
-			"vectors_written": len(indexInfoList),
-			"storage_bytes":   totalStorageSize,
-		})
+		if len(indexInfoList) > 0 {
+			logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
+			s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
+				"vectors_written": len(indexInfoList),
+				"storage_bytes":   totalStorageSize,
+			})
+		}
+
+		if len(obsoleteIDs) > 0 {
+			deletedIDs, deleteErr := s.chunkService.DeleteChunksAndChildren(ctx, knowledge.TenantID, obsoleteIDs)
+			if deleteErr != nil {
+				logger.Warnf(ctx, "Failed to delete obsolete chunks after rebuild: %v", deleteErr)
+			} else if len(deletedIDs) > 0 {
+				if deleteErr := retrieveEngine.DeleteByChunkIDList(ctx, deletedIDs, embeddingModel.GetDimensions(), kb.Type); deleteErr != nil {
+					logger.Warnf(ctx, "Failed to delete obsolete chunk vectors after rebuild: %v", deleteErr)
+				}
+			}
+		}
 
 		// Final check before marking as completed.
 		// deleting → drop chunks+index we just wrote.
@@ -631,6 +698,11 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	} else {
 		logger.Infof(ctx, "Vector/keyword indexing disabled for KB %s, skipping BatchIndex", kb.ID)
 		s.skipStage(ctx, knowledge.ID, types.StageEmbedding, "skipped")
+		if len(obsoleteIDs) > 0 {
+			if _, deleteErr := s.chunkService.DeleteChunksAndChildren(ctx, knowledge.TenantID, obsoleteIDs); deleteErr != nil {
+				logger.Warnf(ctx, "Failed to delete obsolete chunks after rebuild: %v", deleteErr)
+			}
+		}
 	}
 
 	// Check if this document has extracted images that will be processed asynchronously
@@ -730,20 +802,55 @@ func checkSufficientSummaryContent(ctx context.Context, knowledgeID, content str
 	return nil
 }
 
-// getSummary generates a summary for knowledge content using an AI model
-func (s *knowledgeService) getSummary(ctx context.Context,
-	summaryModel chat.Chat, knowledge *types.Knowledge, chunks []*types.Chunk,
-) (string, error) {
-	// Get knowledge info from the first chunk
-	if len(chunks) == 0 {
-		return "", fmt.Errorf("no chunks provided for summary generation")
-	}
-
-	// Determine max input chars from config
+func (s *knowledgeService) summaryMaxInputChars() int {
 	maxInputChars := defaultMaxInputChars
 	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxInputChars > 0 {
 		maxInputChars = s.config.Conversation.Summary.MaxInputChars
 	}
+	return maxInputChars
+}
+
+func (s *knowledgeService) summaryMaxCompletionTokens() int {
+	maxTokens := 2048
+	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxCompletionTokens > 0 {
+		maxTokens = s.config.Conversation.Summary.MaxCompletionTokens
+	}
+	return maxTokens
+}
+
+func summaryModelID(summaryModel chat.Chat, fallback string) string {
+	if summaryModel == nil {
+		return fallback
+	}
+	if id := strings.TrimSpace(summaryModel.GetModelID()); id != "" {
+		return id
+	}
+	return fallback
+}
+
+func (s *knowledgeService) summaryConfigHash(summaryModel chat.Chat, maxInputChars, maxTokens int) string {
+	modelName := ""
+	if summaryModel != nil {
+		modelName = summaryModel.GetModelName()
+	}
+	return artifactConfigHash(types.JSONMap{
+		"model_name":            modelName,
+		"max_input_chars":       maxInputChars,
+		"max_completion_tokens": maxTokens,
+		"temperature":           0.3,
+		"thinking":              false,
+	})
+}
+
+func (s *knowledgeService) prepareSummaryContent(ctx context.Context,
+	knowledge *types.Knowledge, chunks []*types.Chunk,
+) (string, int, error) {
+	// Get knowledge info from the first chunk
+	if len(chunks) == 0 {
+		return "", 0, fmt.Errorf("no chunks provided for summary generation")
+	}
+
+	maxInputChars := s.summaryMaxInputChars()
 
 	// Sort chunks by StartAt for proper concatenation
 	sortedChunks := make([]*types.Chunk, len(chunks))
@@ -805,22 +912,21 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	// hallucinate a scanner manual instead of admitting the document had no
 	// extractable text.
 	if err := checkSufficientSummaryContent(ctx, knowledge.ID, chunkContents); err != nil {
-		return "", err
+		return "", maxInputChars, err
 	}
 
 	// Pass the raw chunk text to the LLM with no filename / file-type framing.
-	contentWithMetadata := chunkContents
+	return chunkContents, maxInputChars, nil
+}
 
-	// Determine max output tokens from config
-	maxTokens := 2048
-	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxCompletionTokens > 0 {
-		maxTokens = s.config.Conversation.Summary.MaxCompletionTokens
-	}
-
+func (s *knowledgeService) generateSummaryFromContent(ctx context.Context,
+	summaryModel chat.Chat, contentWithMetadata string,
+) (string, error) {
 	// Generate summary using AI model
 	summaryPrompt := types.RenderPromptPlaceholders(s.config.Conversation.GenerateSummaryPrompt, types.PlaceholderValues{
 		"language": types.LanguageNameFromContext(ctx),
 	})
+	maxTokens := s.summaryMaxCompletionTokens()
 	thinking := false
 	summary, err := summaryModel.Chat(ctx, []chat.Message{
 		{
@@ -842,6 +948,17 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	}
 	logger.GetLogger(ctx).WithField("summary", summary.Content).Infof("GetSummary success")
 	return summary.Content, nil
+}
+
+// getSummary generates a summary for knowledge content using an AI model.
+func (s *knowledgeService) getSummary(ctx context.Context,
+	summaryModel chat.Chat, knowledge *types.Knowledge, chunks []*types.Chunk,
+) (string, error) {
+	contentWithMetadata, _, err := s.prepareSummaryContent(ctx, knowledge, chunks)
+	if err != nil {
+		return "", err
+	}
+	return s.generateSummaryFromContent(ctx, summaryModel, contentWithMetadata)
 }
 
 // sampleLongContent returns content that fits within maxChars.
@@ -1042,8 +1159,9 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		return fmt.Errorf("failed to get chat model: %w", err)
 	}
 
-	// Generate summary
-	summary, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
+	summaryContent, maxInputChars, err := s.prepareSummaryContent(ctx, knowledge, textChunks)
+	summary := ""
+	summaryCacheHit := false
 	if err != nil {
 		logger.Errorf(ctx, "Failed to generate summary for knowledge %s: %v", payload.KnowledgeID, err)
 		// Surface the underlying LLM/IO error on the span so the trace UI
@@ -1081,6 +1199,60 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			}
 			summaryOut["fallback"] = "first_chunk"
 		}
+	} else {
+		maxTokens := s.summaryMaxCompletionTokens()
+		cacheKey := summaryArtifactKey(
+			payload.TenantID,
+			summaryModelID(chatModel, kb.SummaryModelID),
+			types.LanguageNameFromContext(ctx),
+			artifactPromptVersion(s.config.Conversation.GenerateSummaryPrompt),
+			s.summaryConfigHash(chatModel, maxInputChars, maxTokens),
+			summaryContent,
+		)
+		if s.processCacheRepo != nil {
+			cachePayload, ok, cacheErr := s.processCacheRepo.Get(ctx, cacheKey)
+			if cacheErr != nil {
+				logger.Warnf(ctx, "summary cache read failed, recomputing: %v", cacheErr)
+			} else if ok {
+				if cachedSummary, ok := cachePayload["summary"].(string); ok {
+					summary = cachedSummary
+					summaryCacheHit = true
+					summaryOut["cache_hit"] = true
+				} else {
+					logger.Warnf(ctx, "summary cache payload invalid, recomputing")
+				}
+			}
+		}
+
+		if !summaryCacheHit {
+			summary, err = s.generateSummaryFromContent(ctx, chatModel, summaryContent)
+			if err == nil && s.processCacheRepo != nil {
+				if cacheErr := s.processCacheRepo.Put(ctx, cacheKey, types.JSONMap{"summary": summary}); cacheErr != nil {
+					logger.Warnf(ctx, "summary cache write failed: %v", cacheErr)
+				}
+			}
+		}
+
+		if err != nil {
+			logger.Errorf(ctx, "Failed to generate summary for knowledge %s: %v", payload.KnowledgeID, err)
+			// Surface the underlying LLM/IO error on the span so the trace UI
+			// can explain "why did this stage take 60s and then fall back?"
+			// without forcing the operator to grep worker logs. We also capture
+			// the error type to disambiguate timeouts from upstream HTTP errors
+			// (deadline exceeded vs unexpected EOF vs 5xx, etc.).
+			summaryOut["error"] = previewText(err.Error(), 500)
+			summaryOut["error_type"] = fmt.Sprintf("%T", err)
+			if len(textChunks) > 0 {
+				summary = textChunks[0].Content
+				if len(summary) > 500 {
+					runes := []rune(summary)
+					if len(runes) > 500 {
+						summary = string(runes[:500])
+					}
+				}
+				summaryOut["fallback"] = "first_chunk"
+			}
+		}
 	}
 
 	// Update knowledge description
@@ -1115,12 +1287,13 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		// unreliable signal (e.g. "MX5280.pdf" for a scanned legal letter)
 		// and surfacing them in retrieved RAG context can re-introduce the
 		// hallucination vector this branch is meant to close.
+		summaryChunkContent := fmt.Sprintf("# Summary\n%s", summary)
 		summaryChunk := &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              stableSummaryChunkID(knowledge.ID, summary),
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
 			KnowledgeBaseID: knowledge.KnowledgeBaseID,
-			Content:         fmt.Sprintf("# Summary\n%s", summary),
+			Content:         summaryChunkContent,
 			ChunkIndex:      maxChunkIndex + 1,
 			IsEnabled:       true,
 			CreatedAt:       time.Now(),
@@ -1129,57 +1302,74 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			EndAt:           0,
 			ChunkType:       types.ChunkTypeSummary,
 			ParentChunkID:   textChunks[0].ID,
+			Status:          int(types.ChunkStatusStored),
+			ContentHash:     textContentHash(summaryChunkContent),
+		}
+		needsSummaryIndex := true
+		if existingSummaryChunk, getErr := s.chunkService.GetChunkByIDOnly(ctx, summaryChunk.ID); getErr == nil {
+			summaryChunk = existingSummaryChunk
+			needsSummaryIndex = existingSummaryChunk.Status != int(types.ChunkStatusIndexed)
+			summaryOut["summary_chunk_reused"] = true
 		}
 
 		// Save summary chunk
-		if err := s.chunkService.CreateChunks(ctx, []*types.Chunk{summaryChunk}); err != nil {
+		if err := s.chunkService.CreateChunksIgnoreExisting(ctx, []*types.Chunk{summaryChunk}); err != nil {
 			logger.Errorf(ctx, "Failed to create summary chunk: %v", err)
 			summaryErr = err
 			return fmt.Errorf("failed to create summary chunk: %w", err)
 		}
+		if !needsSummaryIndex {
+			summaryOut["summary_chunk_index_cache_hit"] = true
+			logger.Infof(ctx, "Summary chunk already indexed for knowledge: %s", payload.KnowledgeID)
+		} else {
+			// Index summary chunk
+			tenantInfo, err := s.tenantRepo.GetTenantByID(ctx, payload.TenantID)
+			if err != nil {
+				logger.Errorf(ctx, "Failed to get tenant info: %v", err)
+				summaryErr = err
+				return fmt.Errorf("failed to get tenant info: %w", err)
+			}
+			ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenantInfo)
 
-		// Index summary chunk
-		tenantInfo, err := s.tenantRepo.GetTenantByID(ctx, payload.TenantID)
-		if err != nil {
-			logger.Errorf(ctx, "Failed to get tenant info: %v", err)
-			summaryErr = err
-			return fmt.Errorf("failed to get tenant info: %w", err)
+			retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
+				ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
+			if err != nil {
+				logger.Errorf(ctx, "Failed to init retrieve engine: %v", err)
+				summaryErr = err
+				return fmt.Errorf("failed to init retrieve engine: %w", err)
+			}
+
+			embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
+			if err != nil {
+				logger.Errorf(ctx, "Failed to get embedding model: %v", err)
+				summaryErr = err
+				return fmt.Errorf("failed to get embedding model: %w", err)
+			}
+
+			indexInfo := []*types.IndexInfo{{
+				Content:         summaryChunk.Content,
+				SourceID:        summaryChunk.ID,
+				SourceType:      types.ChunkSourceType,
+				ChunkID:         summaryChunk.ID,
+				KnowledgeID:     knowledge.ID,
+				KnowledgeBaseID: knowledge.KnowledgeBaseID,
+				IsEnabled:       true,
+			}}
+
+			embeddingModel = wrapEmbedderWithProcessCache(knowledge.TenantID, embeddingModel, s.processCacheRepo)
+			if err := retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfo); err != nil {
+				logger.Errorf(ctx, "Failed to index summary chunk: %v", err)
+				summaryErr = err
+				return fmt.Errorf("failed to index summary chunk: %w", err)
+			}
+			summaryChunk.Status = int(types.ChunkStatusIndexed)
+			if err := s.chunkService.UpdateChunk(ctx, summaryChunk); err != nil {
+				logger.Warnf(ctx, "Failed to mark summary chunk indexed: %v", err)
+			}
+
+			logger.Infof(ctx, "Successfully created and indexed summary chunk for knowledge: %s", payload.KnowledgeID)
+			summaryOut["summary_chunk_indexed"] = true
 		}
-		ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenantInfo)
-
-		retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
-			ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
-		if err != nil {
-			logger.Errorf(ctx, "Failed to init retrieve engine: %v", err)
-			summaryErr = err
-			return fmt.Errorf("failed to init retrieve engine: %w", err)
-		}
-
-		embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
-		if err != nil {
-			logger.Errorf(ctx, "Failed to get embedding model: %v", err)
-			summaryErr = err
-			return fmt.Errorf("failed to get embedding model: %w", err)
-		}
-
-		indexInfo := []*types.IndexInfo{{
-			Content:         summaryChunk.Content,
-			SourceID:        summaryChunk.ID,
-			SourceType:      types.ChunkSourceType,
-			ChunkID:         summaryChunk.ID,
-			KnowledgeID:     knowledge.ID,
-			KnowledgeBaseID: knowledge.KnowledgeBaseID,
-			IsEnabled:       true,
-		}}
-
-		if err := retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfo); err != nil {
-			logger.Errorf(ctx, "Failed to index summary chunk: %v", err)
-			summaryErr = err
-			return fmt.Errorf("failed to index summary chunk: %w", err)
-		}
-
-		logger.Infof(ctx, "Successfully created and indexed summary chunk for knowledge: %s", payload.KnowledgeID)
-		summaryOut["summary_chunk_indexed"] = true
 	}
 
 	logger.Infof(ctx, "Successfully generated summary for knowledge: %s", payload.KnowledgeID)
@@ -1221,6 +1411,7 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 	llmCallSuccess := 0
 	llmCallFailed := 0
 	llmCallEmpty := 0
+	questionCacheHits := 0
 	generatedQuestionsTotal := 0
 	chunkMetadataSetFailed := 0
 	chunkUpdateFailed := 0
@@ -1289,6 +1480,7 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 				"llm_success":            llmCallSuccess,
 				"llm_empty":              llmCallEmpty,
 				"llm_failed":             llmCallFailed,
+				"cache_hits":             questionCacheHits,
 				"questions_generated":    generatedQuestionsTotal,
 				"chunk_update_failed":    chunkUpdateFailed,
 				"metadata_set_failed":    chunkMetadataSetFailed,
@@ -1488,8 +1680,14 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 			nextContent = enrichContent(textChunks[i+1])
 		}
 
-		llmCallAttempts++
-		questions, err := s.generateQuestionsWithContext(ctx, chatModel, enrichContent(chunk), prevContent, nextContent, knowledge.Title, questionCount)
+		content := enrichContent(chunk)
+		questions, cacheHit, err := s.getOrGenerateQuestionsWithCache(
+			ctx, payload.TenantID, kb.SummaryModelID, chatModel, content, prevContent, nextContent, knowledge.Title, questionCount)
+		if cacheHit {
+			questionCacheHits++
+		} else {
+			llmCallAttempts++
+		}
 		if err != nil {
 			llmCallFailed++
 			logger.Warnf(ctx, "Failed to generate questions for chunk %s: %v", chunk.ID, err)
@@ -1500,21 +1698,15 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 			llmCallEmpty++
 			continue
 		}
-		llmCallSuccess++
+		if !cacheHit {
+			llmCallSuccess++
+		}
 		generatedQuestionsTotal += len(questions)
 		if sampleQuestion == "" && len(questions) > 0 {
 			sampleQuestion = previewText(questions[0], 200)
 		}
 
-		// Update chunk metadata with unique IDs for each question
-		generatedQuestions := make([]types.GeneratedQuestion, len(questions))
-		for j, question := range questions {
-			questionID := fmt.Sprintf("q%d", time.Now().UnixNano()+int64(j))
-			generatedQuestions[j] = types.GeneratedQuestion{
-				ID:       questionID,
-				Question: question,
-			}
-		}
+		generatedQuestions := generatedQuestionsForChunk(chunk.ID, questions)
 		meta := &types.DocumentChunkMetadata{
 			GeneratedQuestions: generatedQuestions,
 		}
@@ -1551,6 +1743,7 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 	// Index generated questions
 	if len(indexInfoList) > 0 {
 		indexBatchAttempted = true
+		embeddingModel = wrapEmbedderWithProcessCache(payload.TenantID, embeddingModel, s.processCacheRepo)
 		if err := retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList); err != nil {
 			exitStatus = "index_questions_failed"
 			logger.Errorf(ctx, "Failed to index generated questions: %v", err)
@@ -1587,6 +1780,7 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 	chunksProcessed := 0
 	emptyChunks := 0
 	llmCallFailed := 0
+	questionCacheHits := 0
 	generatedQuestionsTotal := 0
 	indexEntriesPrepared := 0
 	indexBatchSucceeded := false
@@ -1627,6 +1821,7 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 				"chunks_processed":       chunksProcessed,
 				"empty_chunks":           emptyChunks,
 				"llm_failed":             llmCallFailed,
+				"cache_hits":             questionCacheHits,
 				"questions_generated":    generatedQuestionsTotal,
 				"index_entries_prepared": indexEntriesPrepared,
 				"index_batch_succeeded":  indexBatchSucceeded,
@@ -1814,8 +2009,20 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 			continue
 		}
 
-		questions, gerr := s.generateQuestionsWithContext(
-			ctx, chatModel, enrich(chunk), prevContentAt(i), nextContentAt(i), knowledge.Title, questionCount)
+		questions, cacheHit, gerr := s.getOrGenerateQuestionsWithCache(
+			ctx,
+			payload.TenantID,
+			kb.SummaryModelID,
+			chatModel,
+			enrich(chunk),
+			prevContentAt(i),
+			nextContentAt(i),
+			knowledge.Title,
+			questionCount,
+		)
+		if cacheHit {
+			questionCacheHits++
+		}
 		if gerr != nil {
 			llmCallFailed++
 			logger.Warnf(ctx, "Failed to generate questions for chunk %s: %v", chunk.ID, gerr)
@@ -1830,13 +2037,7 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 			sampleQuestion = previewText(questions[0], 200)
 		}
 
-		generatedQuestions := make([]types.GeneratedQuestion, len(questions))
-		for j, question := range questions {
-			generatedQuestions[j] = types.GeneratedQuestion{
-				ID:       fmt.Sprintf("q%d", time.Now().UnixNano()+int64(j)),
-				Question: question,
-			}
-		}
+		generatedQuestions := generatedQuestionsForChunk(chunk.ID, questions)
 		meta := &types.DocumentChunkMetadata{GeneratedQuestions: generatedQuestions}
 		if err := chunk.SetDocumentMetadata(meta); err != nil {
 			logger.Warnf(ctx, "Failed to set document metadata for chunk %s: %v", chunk.ID, err)
@@ -1861,6 +2062,7 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 
 	indexEntriesPrepared = len(indexInfoList)
 	if len(indexInfoList) > 0 {
+		embeddingModel = wrapEmbedderWithProcessCache(payload.TenantID, embeddingModel, s.processCacheRepo)
 		if err := retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList); err != nil {
 			exitStatus = "index_questions_failed"
 			qErr = err
@@ -1943,6 +2145,93 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 	}
 
 	return questions, nil
+}
+
+func (s *knowledgeService) questionConfigHash(chatModel chat.Chat) string {
+	modelName := ""
+	if chatModel != nil {
+		modelName = chatModel.GetModelName()
+	}
+	return artifactConfigHash(types.JSONMap{
+		"model_name":  modelName,
+		"temperature": 0.7,
+		"max_tokens":  512,
+		"thinking":    false,
+	})
+}
+
+func (s *knowledgeService) getOrGenerateQuestionsWithCache(ctx context.Context,
+	tenantID uint64,
+	modelID string,
+	chatModel chat.Chat,
+	content, prevContent, nextContent, docName string,
+	questionCount int,
+) ([]string, bool, error) {
+	cacheKey := questionArtifactKey(
+		tenantID,
+		summaryModelID(chatModel, modelID),
+		types.LanguageNameFromContext(ctx),
+		artifactPromptVersion(s.config.Conversation.GenerateQuestionsPrompt),
+		s.questionConfigHash(chatModel),
+		docName,
+		content,
+		prevContent,
+		nextContent,
+		questionCount,
+	)
+
+	if s.processCacheRepo != nil {
+		cachePayload, ok, cacheErr := s.processCacheRepo.Get(ctx, cacheKey)
+		if cacheErr != nil {
+			logger.Warnf(ctx, "question cache read failed, recomputing: %v", cacheErr)
+		} else if ok {
+			if questions, ok := jsonStrings(cachePayload["questions"]); ok {
+				return questions, true, nil
+			}
+			logger.Warnf(ctx, "question cache payload invalid, recomputing")
+		}
+	}
+
+	questions, err := s.generateQuestionsWithContext(ctx, chatModel, content, prevContent, nextContent, docName, questionCount)
+	if err != nil {
+		return nil, false, err
+	}
+	if s.processCacheRepo != nil {
+		if cacheErr := s.processCacheRepo.Put(ctx, cacheKey, types.JSONMap{"questions": questions}); cacheErr != nil {
+			logger.Warnf(ctx, "question cache write failed: %v", cacheErr)
+		}
+	}
+	return questions, false, nil
+}
+
+func jsonStrings(v any) ([]string, bool) {
+	switch values := v.(type) {
+	case []string:
+		return append([]string(nil), values...), true
+	case []any:
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			s, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func generatedQuestionsForChunk(chunkID string, questions []string) []types.GeneratedQuestion {
+	generatedQuestions := make([]types.GeneratedQuestion, len(questions))
+	for j, question := range questions {
+		generatedQuestions[j] = types.GeneratedQuestion{
+			ID:       stableQuestionID(chunkID, question, j),
+			Question: question,
+		}
+	}
+	return generatedQuestions
 }
 
 // ReparseKnowledge deletes existing document content and re-parses the knowledge asynchronously.
@@ -2051,16 +2340,9 @@ func (s *knowledgeService) ReparseKnowledge(
 		return existing, nil
 	}
 
-	// For non-manual knowledge, cleanup synchronously then enqueue document processing
-	logger.Infof(ctx, "Cleaning up existing resources for knowledge: %s", knowledgeID)
-	if err := s.cleanupKnowledgeResources(ctx, existing); err != nil {
-		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"knowledge_id": knowledgeID,
-		})
-		return nil, err
-	}
-
-	// Step 2: Update knowledge status and metadata
+	// For non-manual knowledge, keep reusable chunks/vectors in place. The
+	// worker reconciles deterministic chunk IDs and removes obsolete rows only
+	// after replacement indexing succeeds.
 	existing.ParseStatus = "pending"
 	existing.EnableStatus = "disabled"
 	existing.Description = ""
@@ -2391,6 +2673,7 @@ func (s *knowledgeService) updateChunkVector(ctx context.Context, kbID string, c
 	}
 
 	// Index updated chunk content with new vector representation
+	embeddingModel = wrapEmbedderWithProcessCache(types.MustTenantIDFromContext(ctx), embeddingModel, s.processCacheRepo)
 	err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfo)
 	if err != nil {
 		return err
@@ -2641,19 +2924,9 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 	}
 	ctx = withAttempt(ctx, attempt)
 
-	// Cleanup old resources (indexes, chunks, graph) for update operations
-	if payload.NeedCleanup {
-		if err := s.cleanupKnowledgeResources(ctx, knowledge); err != nil {
-			logger.ErrorWithFields(ctx, err, map[string]interface{}{
-				"knowledge_id": payload.KnowledgeID,
-			})
-			knowledge.ParseStatus = "failed"
-			knowledge.ErrorMessage = fmt.Sprintf("failed to cleanup old resources: %v", err)
-			knowledge.UpdatedAt = time.Now()
-			s.repo.UpdateKnowledge(ctx, knowledge)
-			return nil
-		}
-	}
+	// Rebuild-aware processChunks performs artifact reconciliation. Do not
+	// pre-clean chunks, vectors, or graph here; doing so would force an
+	// unchanged manual update to recompute deterministic artifacts.
 
 	// Run manual processing (image resolution + chunking + embedding) synchronously within the worker
 	s.triggerManualProcessing(ctx, kb, knowledge, payload.Content, true)
@@ -3167,6 +3440,35 @@ func (s *knowledgeService) convert(
 		req.FileType = fileType
 	}
 
+	var docReaderCacheKey *types.ProcessArtifactCacheKey
+	if !isURL && len(req.FileContent) > 0 && s.processCacheRepo != nil {
+		configHash := artifactConfigHash(types.JSONMap{
+			"parser_engine":         parserEngine,
+			"file_type":             fileType,
+			"parser_overrides":      mergedOverrides,
+			"chunking_parser_rules": eff.ChunkingConfig.ParserEngineRules,
+		})
+		key := docReaderArtifactKey(knowledge.TenantID, fileType, parserEngine, configHash, req.FileContent)
+		docReaderCacheKey = &key
+		cached, ok, cacheErr := s.processCacheRepo.Get(ctx, key)
+		if cacheErr != nil {
+			logger.Warnf(ctx, "docreader cache read failed, recomputing: %v", cacheErr)
+		} else if ok {
+			result := decodeReadResultPayload(cached)
+			docOutput := types.JSONMap{
+				"text_length":  len(result.MarkdownContent),
+				"images_found": len(result.ImageRefs),
+				"is_audio":     result.IsAudio,
+				"cache_hit":    true,
+			}
+			if pages := result.Metadata["pages"]; pages != "" {
+				docOutput["pages"] = pages
+			}
+			s.endStage(ctx, knowledge.ID, types.StageDocReader, docOutput)
+			return result, nil
+		}
+	}
+
 	result, err := s.callDocReaderWithTimeout(ctx, reader, req)
 	if err != nil {
 		// Distinguish DocReader timeout (a knowable user-facing
@@ -3190,6 +3492,11 @@ func (s *knowledgeService) convert(
 		s.failStage(ctx, knowledge.ID, types.StageDocReader,
 			werrors.ErrCodeDocReaderParseFailed, result.Error, nil)
 		return nil, nil
+	}
+	if docReaderCacheKey != nil {
+		if putErr := s.processCacheRepo.Put(ctx, *docReaderCacheKey, encodeReadResultPayload(result)); putErr != nil {
+			logger.Warnf(ctx, "docreader cache write failed: %v", putErr)
+		}
 	}
 	docOutput := types.JSONMap{
 		"text_length":  len(result.MarkdownContent),

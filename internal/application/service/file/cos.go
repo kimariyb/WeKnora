@@ -236,6 +236,19 @@ func (s *cosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	return fmt.Sprintf("cos://%s/%s/%s", s.bucketName, s.region, objectName), nil
 }
 
+func (s *cosFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	objectName := strings.TrimPrefix(fmt.Sprintf("%s/%d/exports/cache/%s", strings.TrimRight(s.cosPathPrefix, "/"), tenantID, safeName), "/")
+	_, err = s.client.Object.Put(ctx, objectName, bytes.NewReader(data), nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to COS: %w", err)
+	}
+	return fmt.Sprintf("cos://%s/%s/%s", s.bucketName, s.region, objectName), nil
+}
+
 // GetFileURL returns a presigned download URL for the file
 func (s *cosFileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
 	// 判断文件属于哪个桶

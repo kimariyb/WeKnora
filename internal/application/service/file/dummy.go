@@ -3,6 +3,7 @@ package file
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 
@@ -46,6 +47,10 @@ func (s *DummyFileService) DeleteFile(ctx context.Context, filePath string) erro
 // SaveBytes pretends to save bytes but just returns a random UUID
 func (s *DummyFileService) SaveBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
 	return uuid.New().String(), nil
+}
+
+func (s *DummyFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	return fmt.Sprintf("dummy://%d/exports/cache/%s", tenantID, fileName), nil
 }
 
 // CopyFile is a no-op for the dummy service: it logs a warning and returns the

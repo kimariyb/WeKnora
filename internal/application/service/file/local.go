@@ -245,6 +245,40 @@ func (s *localFileService) SaveBytes(ctx context.Context, data []byte, tenantID 
 	return localScheme + filepath.ToSlash(relPath), nil
 }
 
+func (s *localFileService) SaveContentAddressedBytes(
+	ctx context.Context,
+	data []byte,
+	tenantID uint64,
+	fileName string,
+	temp bool,
+) (string, error) {
+	logger.Infof(ctx, "Saving content-addressed bytes: fileName=%s, size=%d, tenantID=%d, temp=%v", fileName, len(data), tenantID, temp)
+
+	safeName, err := secutils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+
+	dir := filepath.Join(s.baseDir, fmt.Sprintf("%d", tenantID), "exports", "cache")
+	if _, err := secutils.SafePathUnderBase(s.baseDir, dir); err != nil {
+		return "", fmt.Errorf("invalid path: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	filePath := filepath.Join(dir, safeName)
+	if _, err := secutils.SafePathUnderBase(s.baseDir, filePath); err != nil {
+		return "", fmt.Errorf("invalid path: %w", err)
+	}
+	if err := os.WriteFile(filePath, data, 0o644); err != nil {
+		return "", fmt.Errorf("failed to write file: %w", err)
+	}
+
+	relPath, _ := filepath.Rel(s.baseDir, filePath)
+	return localScheme + filepath.ToSlash(relPath), nil
+}
+
 // GetFileURL returns a download URL for the file.
 // When externalURL is configured, returns a presigned HTTP URL suitable for external access.
 // Otherwise returns the local://... path for backward compatibility.

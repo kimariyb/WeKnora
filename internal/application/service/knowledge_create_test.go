@@ -97,6 +97,16 @@ func (s *createKnowledgeFileServiceStub) SaveBytes(
 	return "", errors.New("not implemented")
 }
 
+func (s *createKnowledgeFileServiceStub) SaveContentAddressedBytes(
+	ctx context.Context,
+	data []byte,
+	tenantID uint64,
+	fileName string,
+	temp bool,
+) (string, error) {
+	return "", errors.New("not implemented")
+}
+
 func (s *createKnowledgeFileServiceStub) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
 	return nil, errors.New("not implemented")
 }

@@ -3,6 +3,7 @@ package file
 import (
 	"context"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -39,4 +40,18 @@ func TestLocalGetFileURL_NoExternalURL(t *testing.T) {
 	got, err := svc.GetFileURL(context.Background(), "local://1/abc/img.png")
 	require.NoError(t, err)
 	assert.Equal(t, "local://1/abc/img.png", got)
+}
+
+func TestLocalSaveContentAddressedBytesReturnsStablePath(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewLocalFileService(dir, "")
+
+	got1, err := svc.SaveContentAddressedBytes(context.Background(), []byte("same"), 7, "abc.png", false)
+	require.NoError(t, err)
+	got2, err := svc.SaveContentAddressedBytes(context.Background(), []byte("same"), 7, "abc.png", false)
+	require.NoError(t, err)
+
+	require.Equal(t, got1, got2)
+	require.Contains(t, got1, "/7/exports/cache/")
+	require.True(t, strings.HasSuffix(got1, "/abc.png"))
 }

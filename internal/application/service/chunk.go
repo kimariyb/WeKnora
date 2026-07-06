@@ -78,6 +78,20 @@ func (s *chunkService) CreateChunks(ctx context.Context, chunks []*types.Chunk) 
 	return nil
 }
 
+func (s *chunkService) CreateChunksIgnoreExisting(ctx context.Context, chunks []*types.Chunk) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	if err := s.chunkRepository.CreateChunksIgnoreExisting(ctx, chunks); err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"chunk_count": len(chunks),
+		})
+		return err
+	}
+	logger.Infof(ctx, "Add %d chunks successfully, ignoring existing rows", len(chunks))
+	return nil
+}
+
 // GetChunkByID retrieves a chunk by its ID
 // This method fetches a specific chunk using its ID and validates tenant access
 // Parameters:
@@ -143,6 +157,15 @@ func (s *chunkService) ListChunksByKnowledgeID(ctx context.Context, knowledgeID 
 
 	logger.Infof(ctx, "Retrieved %d chunks successfully", len(chunks))
 	return chunks, nil
+}
+
+func (s *chunkService) ListChunksByKnowledgeIDIncludeTypes(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID string,
+	chunkTypes []types.ChunkType,
+) ([]*types.Chunk, error) {
+	return s.chunkRepository.ListChunksByKnowledgeIDIncludeTypes(ctx, tenantID, knowledgeID, chunkTypes)
 }
 
 // ListPagedChunksByKnowledgeID lists chunks for a knowledge ID with pagination
@@ -280,6 +303,10 @@ func (s *chunkService) DeleteChunks(ctx context.Context, ids []string) error {
 
 	logger.Infof(ctx, "Successfully deleted %d chunks", len(ids))
 	return nil
+}
+
+func (s *chunkService) DeleteChunksAndChildren(ctx context.Context, tenantID uint64, ids []string) ([]string, error) {
+	return s.chunkRepository.DeleteChunksAndChildren(ctx, tenantID, ids)
 }
 
 // DeleteChunksByKnowledgeID deletes all chunks for a knowledge ID

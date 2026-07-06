@@ -214,6 +214,22 @@ func (s *minioFileService) SaveBytes(ctx context.Context, data []byte, tenantID 
 	return fmt.Sprintf("minio://%s/%s", s.bucketName, objectName), nil
 }
 
+func (s *minioFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	safeName, err := utils.SafeFileName(fileName)
+	if err != nil {
+		return "", fmt.Errorf("invalid file name: %w", err)
+	}
+	objectName := fmt.Sprintf("%d/exports/cache/%s", tenantID, safeName)
+	reader := bytes.NewReader(data)
+	_, err = s.client.PutObject(ctx, s.bucketName, objectName, reader, int64(len(data)), minio.PutObjectOptions{
+		ContentType: utils.GetContentTypeByExt(filepath.Ext(safeName)),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload content-addressed bytes to MinIO: %w", err)
+	}
+	return fmt.Sprintf("minio://%s/%s", s.bucketName, objectName), nil
+}
+
 // GetFileURL returns a presigned download URL for the file
 func (s *minioFileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
 	objectName, err := s.parseMinioFilePath(filePath)

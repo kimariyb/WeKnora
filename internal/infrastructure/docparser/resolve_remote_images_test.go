@@ -30,6 +30,10 @@ func (m *mockFileService) SaveBytes(ctx context.Context, data []byte, tenantID u
 	m.saved = append(m.saved, savedEntry{Data: data, TenantID: tenantID, FileName: fileName})
 	return fmt.Sprintf("local://images/%s", fileName), nil
 }
+func (m *mockFileService) SaveContentAddressedBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
+	m.saved = append(m.saved, savedEntry{Data: data, TenantID: tenantID, FileName: fileName})
+	return fmt.Sprintf("local://images/%s", fileName), nil
+}
 func (m *mockFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
 	return nil, nil
 }
